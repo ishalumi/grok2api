@@ -27,7 +27,7 @@ DEFAULT_GROK = {
 }
 
 DEFAULT_GLOBAL = {
-    "base_url": "http://localhost:8000",
+    "base_url": "http://localhost:8010",
     "log_level": "INFO",
     "image_mode": "url",
     "admin_password": "admin",
