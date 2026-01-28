@@ -1,5 +1,6 @@
 """配置管理器 - 管理应用配置的读写"""
 
+import os
 import toml
 from pathlib import Path
 from typing import Dict, Any, Optional, Literal
@@ -102,6 +103,13 @@ class ConfigManager:
                     config["cache_proxy_url"] = self._normalize_proxy(config["cache_proxy_url"])
                 if "cf_clearance" in config:
                     config["cf_clearance"] = self._normalize_cf(config["cf_clearance"])
+
+            # 环境变量覆盖（优先级最高）
+            if section == "global":
+                if os.getenv("ADMIN_USERNAME"):
+                    config["admin_username"] = os.getenv("ADMIN_USERNAME")
+                if os.getenv("ADMIN_PASSWORD"):
+                    config["admin_password"] = os.getenv("ADMIN_PASSWORD")
 
             return config
         except Exception as e:

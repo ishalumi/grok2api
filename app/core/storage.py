@@ -1,4 +1,4 @@
-"""存储抽象层 - 支持文件、MySQL和Redis存储"""
+"""存储抽象层 - 支持文件、MySQL、PostgreSQL和Redis存储"""
 
 import os
 import orjson
@@ -14,7 +14,7 @@ from urllib.parse import urlparse, unquote
 from app.core.logger import logger
 
 
-StorageMode = Literal["file", "mysql", "redis"]
+StorageMode = Literal["file", "mysql", "postgres", "redis"]
 
 
 class BaseStorage(ABC):
@@ -307,6 +307,171 @@ class MysqlStorage(BaseStorage):
             logger.info("[Storage] MySQL已关闭")
 
 
+class PostgresStorage(BaseStorage):
+    """PostgreSQL存储"""
+
+    def __init__(self, database_url: str, data_dir: Path):
+        self.database_url = database_url
+        self.data_dir = data_dir
+        self._pool = None
+        self._file = FileStorage(data_dir)
+
+    async def init_db(self) -> None:
+        """初始化PostgreSQL"""
+        try:
+            import asyncpg
+            parsed = self._parse_url(self.database_url)
+            logger.info(f"[Storage] PostgreSQL: {parsed['user']}@{parsed['host']}:{parsed['port']}/{parsed['db']}")
+
+            await self._create_db(parsed)
+            self._pool = await asyncpg.create_pool(
+                host=parsed['host'], port=parsed['port'], user=parsed['user'],
+                password=parsed['password'], database=parsed['db'], min_size=1, max_size=10
+            )
+            await self._create_tables()
+            await self._file.init_db()
+            await self._sync_data()
+
+        except ImportError:
+            raise Exception("asyncpg未安装，请运行: pip install asyncpg")
+        except Exception as e:
+            logger.error(f"[Storage] PostgreSQL初始化失败: {e}")
+            raise
+
+    def _parse_url(self, url: str) -> Dict[str, Any]:
+        """解析URL"""
+        p = urlparse(url)
+        return {
+            'user': unquote(p.username) if p.username else "postgres",
+            'password': unquote(p.password) if p.password else "",
+            'host': p.hostname or "localhost",
+            'port': p.port or 5432,
+            'db': p.path[1:] if p.path else "grok2api"
+        }
+
+    async def _create_db(self, parsed: Dict) -> None:
+        """创建数据库"""
+        import asyncpg
+        try:
+            conn = await asyncpg.connect(
+                host=parsed['host'], port=parsed['port'], user=parsed['user'],
+                password=parsed['password'], database='postgres'
+            )
+            try:
+                exists = await conn.fetchval(
+                    "SELECT 1 FROM pg_database WHERE datname = $1", parsed['db']
+                )
+                if not exists:
+                    await conn.execute(f"CREATE DATABASE \"{parsed['db']}\"")
+                    logger.info(f"[Storage] 数据库 '{parsed['db']}' 已创建")
+                else:
+                    logger.info(f"[Storage] 数据库 '{parsed['db']}' 就绪")
+            finally:
+                await conn.close()
+        except asyncpg.InvalidCatalogNameError:
+            pass
+
+    async def _create_tables(self) -> None:
+        """创建表"""
+        tables = [
+            """
+            CREATE TABLE IF NOT EXISTS grok_tokens (
+                id SERIAL PRIMARY KEY,
+                data JSONB NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS grok_settings (
+                id SERIAL PRIMARY KEY,
+                data JSONB NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        ]
+
+        async with self._pool.acquire() as conn:
+            for sql in tables:
+                await conn.execute(sql)
+            logger.info("[Storage] PostgreSQL表就绪")
+
+    async def _sync_data(self) -> None:
+        """同步数据"""
+        try:
+            for table, key in [("grok_tokens", "sso"), ("grok_settings", "global")]:
+                data = await self._load_db(table)
+                if data:
+                    if table == "grok_tokens":
+                        await self._file.save_tokens(data)
+                    else:
+                        await self._file.save_config(data)
+                    logger.info(f"[Storage] {table.split('_')[1]}数据已从DB同步")
+                else:
+                    file_data = await (self._file.load_tokens() if table == "grok_tokens" else self._file.load_config())
+                    if file_data.get(key) or (table == "grok_tokens" and file_data.get("ssoSuper")):
+                        await self._save_db(table, file_data)
+                        logger.info(f"[Storage] {table.split('_')[1]}数据已初始化到DB")
+        except Exception as e:
+            logger.warning(f"[Storage] 同步失败: {e}")
+
+    async def _load_db(self, table: str) -> Optional[Dict]:
+        """从DB加载"""
+        try:
+            async with self._pool.acquire() as conn:
+                result = await conn.fetchrow(f"SELECT data FROM {table} ORDER BY id DESC LIMIT 1")
+                if result:
+                    data = result['data']
+                    return orjson.loads(data) if isinstance(data, str) else data
+                return None
+        except Exception as e:
+            logger.error(f"[Storage] 加载{table}失败: {e}")
+            return None
+
+    async def _save_db(self, table: str, data: Dict) -> None:
+        """保存到DB"""
+        try:
+            async with self._pool.acquire() as conn:
+                json_data = orjson.dumps(data).decode()
+                result = await conn.fetchrow(f"SELECT id FROM {table} ORDER BY id DESC LIMIT 1")
+
+                if result:
+                    await conn.execute(
+                        f"UPDATE {table} SET data = $1::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
+                        json_data, result['id']
+                    )
+                else:
+                    await conn.execute(f"INSERT INTO {table} (data) VALUES ($1::jsonb)", json_data)
+        except Exception as e:
+            logger.error(f"[Storage] 保存{table}失败: {e}")
+            raise
+
+    async def load_tokens(self) -> Dict[str, Any]:
+        """加载token"""
+        return await self._file.load_tokens()
+
+    async def save_tokens(self, data: Dict[str, Any]) -> None:
+        """保存token"""
+        await self._file.save_tokens(data)
+        await self._save_db("grok_tokens", data)
+
+    async def load_config(self) -> Dict[str, Any]:
+        """加载配置"""
+        return await self._file.load_config()
+
+    async def save_config(self, data: Dict[str, Any]) -> None:
+        """保存配置"""
+        await self._file.save_config(data)
+        await self._save_db("grok_settings", data)
+
+    async def close(self) -> None:
+        """关闭连接"""
+        if self._pool:
+            await self._pool.close()
+            logger.info("[Storage] PostgreSQL已关闭")
+
+
 class RedisStorage(BaseStorage):
     """Redis存储"""
 
@@ -417,9 +582,9 @@ class StorageManager:
         url = os.getenv("DATABASE_URL", "")
         data_dir = Path(__file__).parents[2] / "data"
 
-        classes = {"mysql": MysqlStorage, "redis": RedisStorage, "file": FileStorage}
+        classes = {"mysql": MysqlStorage, "postgres": PostgresStorage, "postgresql": PostgresStorage, "redis": RedisStorage, "file": FileStorage}
 
-        if mode in ("mysql", "redis") and not url:
+        if mode in ("mysql", "postgres", "postgresql", "redis") and not url:
             raise ValueError(f"{mode.upper()}模式需要DATABASE_URL")
 
         storage_class = classes.get(mode, FileStorage)

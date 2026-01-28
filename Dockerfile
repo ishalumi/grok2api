@@ -46,10 +46,10 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 ENV PYTHONDONTWRITEBYTECODE=1 \
   PYTHONUNBUFFERED=1
 
-EXPOSE 8000
+EXPOSE 8010
 
 # 使用 entrypoint 脚本初始化配置
 ENTRYPOINT ["docker-entrypoint.sh"]
 
 # 默认启动命令
-CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8010"]
